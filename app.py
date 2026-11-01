@@ -1,0 +1,513 @@
+"""
+مقارنة أسعار العسل — Honey Price Tracker
+تشغيل محلي:  streamlit run app.py
+"""
+import re
+import json
+import os
+import datetime
+import html
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse, urljoin, unquote
+
+import requests
+import pandas as pd
+import streamlit as st
+from bs4 import BeautifulSoup
+
+# ------------------------------------------------------------------ إعدادات
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "ar,en;q=0.9",
+}
+TIMEOUT = 20
+URLS_FILE = "urls.txt"
+HISTORY_FILE = "prices_history.csv"
+
+AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩٫٬", "0123456789.,")
+CURRENCY = r"(?:EGP|L\.?E|ج\.?\s?م\.?|جنيه(?:ا|ًا)?|جنية)"
+NUM = r"([\d٠-٩][\d٠-٩.,٬٫]*)"
+PRICE_RE = re.compile(rf"(?:{CURRENCY}\s*{NUM}|{NUM}\s*{CURRENCY})", re.I)
+WEIGHT_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*(كيلوجرام|كيلو|كجم|كغ|kg|kilo|جرام|غرام|جم|gram|gm|g)(?![a-zA-Z])",
+    re.I,
+)
+KG_UNITS = {"كيلوجرام", "كيلو", "كجم", "كغ", "kg", "kilo"}
+
+
+# ------------------------------------------------------------------ أدوات مساعدة
+def to_number(text):
+    """يحوّل نصاً (بأرقام عربية أو إنجليزية) إلى رقم."""
+    if text is None:
+        return None
+    s = str(text).translate(AR_DIGITS)
+    s = re.sub(r"[^\d.,]", "", s)
+    if not s:
+        return None
+    if "," in s and "." in s:
+        s = s.replace(",", "")
+    elif "," in s:
+        parts = s.split(",")
+        s = s.replace(",", "") if len(parts[-1]) == 3 else s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def parse_weight_kg(text):
+    """يستخرج الوزن بالكيلو من اسم المنتج (مثل: 500 جرام، 1 كيلو، نصف كيلو)."""
+    if not text:
+        return None
+    t = str(text).translate(AR_DIGITS)
+    if re.search(r"نص(?:ف)?\s*كيلو", t):
+        return 0.5
+    if re.search(r"ربع\s*كيلو", t):
+        return 0.25
+    m = WEIGHT_RE.search(t)
+    if not m:
+        return None
+    value = to_number(m.group(1))
+    if not value:
+        return None
+    return value if m.group(2).lower() in KG_UNITS else value / 1000
+
+
+def get_title(soup):
+    og = soup.find("meta", property="og:title")
+    if og and og.get("content"):
+        return og["content"].strip()
+    h1 = soup.find("h1")
+    if h1 and h1.get_text(strip=True):
+        return h1.get_text(strip=True)
+    return soup.title.get_text(strip=True) if soup.title else ""
+
+
+# ------------------------------------------------------------------ طرق الاستخراج
+def try_shopify(url):
+    """متاجر Shopify: نقرأ بيانات المنتج مباشرة بكل أحجامه."""
+    p = urlparse(url)
+    if "/products/" not in p.path:
+        return None
+    try:
+        r = requests.get(f"{p.scheme}://{p.netloc}{p.path.rstrip('/')}.js",
+                         headers=HEADERS, timeout=TIMEOUT)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+    except Exception:
+        return None
+    rows = []
+    for v in data.get("variants", []):
+        variant = v.get("title") or ""
+        if variant == "Default Title":
+            variant = ""
+        weight = parse_weight_kg(variant) or parse_weight_kg(data.get("title"))
+        if not weight and v.get("grams"):
+            weight = v["grams"] / 1000
+        rows.append({
+            "product": data.get("title", ""),
+            "variant": variant,
+            "price": v.get("price", 0) / 100,
+            "available": v.get("available"),
+            "weight_kg": weight,
+            "method": "Shopify",
+        })
+    return rows or None
+
+
+def walk_jsonld(node):
+    if isinstance(node, list):
+        for item in node:
+            yield from walk_jsonld(item)
+    elif isinstance(node, dict):
+        yield node
+        for key in ("@graph", "hasVariant", "mainEntity"):
+            if key in node:
+                yield from walk_jsonld(node[key])
+
+
+def from_jsonld(soup):
+    rows = []
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or "")
+        except Exception:
+            continue
+        for node in walk_jsonld(data):
+            types = node.get("@type")
+            types = types if isinstance(types, list) else [types]
+            if "Product" not in types:
+                continue
+            offers = node.get("offers") or []
+            offers = offers if isinstance(offers, list) else [offers]
+            for off in offers:
+                if not isinstance(off, dict):
+                    continue
+                price = to_number(off.get("price") or off.get("lowPrice"))
+                if not price:
+                    continue
+                avail = str(off.get("availability", ""))
+                name = node.get("name", "")
+                rows.append({
+                    "product": name,
+                    "variant": off.get("name", "") if off.get("name") != name else "",
+                    "price": price,
+                    "available": ("InStock" in avail) if avail else None,
+                    "weight_kg": parse_weight_kg(off.get("name")) or parse_weight_kg(name),
+                    "method": "JSON-LD",
+                })
+    return rows or None
+
+
+def from_meta(soup):
+    for attrs in ({"property": "product:price:amount"}, {"property": "og:price:amount"},
+                  {"itemprop": "price"}):
+        tag = soup.find(attrs=attrs)
+        if tag:
+            price = to_number(tag.get("content") or tag.get_text())
+            if price:
+                return [{"price": price, "method": "Meta"}]
+    return None
+
+
+def from_text(soup):
+    """الحل الأخير: نبحث عن السعر في عناصر الصفحة أو نصها."""
+    for sel in (".price ins .amount", ".price .amount", "[class*=price]", "[id*=price]"):
+        for el in soup.select(sel)[:5]:
+            price = to_number(el.get_text(" ", strip=True))
+            if price and price > 1:
+                return [{"price": price, "method": "HTML"}]
+    m = PRICE_RE.search(soup.get_text(" ", strip=True))
+    if m:
+        price = to_number(m.group(1) or m.group(2))
+        if price:
+            return [{"price": price, "method": "Text"}]
+    return None
+
+
+def base_row(url):
+    return {"site": urlparse(url).netloc.replace("www.", ""), "url": url, "product": "",
+            "variant": "", "price": None, "available": None, "weight_kg": None,
+            "method": "", "error": ""}
+
+
+def scrape_product(url):
+    """يستخرج السعر من صفحة منتج واحدة."""
+    base = base_row(url)
+    rows = try_shopify(url)
+    if not rows:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            r.raise_for_status()
+        except Exception as e:
+            return [{**base, "error": f"تعذّر فتح الصفحة: {e}"}]
+        if not r.encoding or r.encoding.lower() in ("iso-8859-1", "ascii"):
+            r.encoding = r.apparent_encoding or "utf-8"
+        soup = BeautifulSoup(r.text, "html.parser")
+        title = get_title(soup)
+        rows = from_jsonld(soup) or from_meta(soup) or from_text(soup)
+        if not rows:
+            return [{**base, "product": title,
+                     "error": "لم يُعثر على سعر (قد تُحمّل الصفحة السعر بجافاسكربت)"}]
+        for row in rows:
+            row["product"] = row.get("product") or title
+            row["weight_kg"] = row.get("weight_kg") or parse_weight_kg(row["product"])
+    return [{**base, **row} for row in rows]
+
+
+# ------------------------------------------------------------------ البحث في الموقع كله
+def site_root(url):
+    p = urlparse(url)
+    return f"{p.scheme}://{p.netloc}"
+
+
+EXCLUDE = []  # تُملأ من الواجهة
+
+
+def matches(text, keywords):
+    t = unquote(str(text)).lower()
+    if any(x in t for x in EXCLUDE):
+        return False
+    return not keywords or any(k in t for k in keywords)
+
+
+def get_json(url, params=None):
+    try:
+        r = requests.get(url, headers=HEADERS, params=params, timeout=TIMEOUT)
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        return None
+
+
+def scan_shopify(root, keywords):
+    """متاجر Shopify: كل المنتجات متاحة في /products.json"""
+    rows, is_shopify = [], False
+    for page in range(1, 6):
+        data = get_json(f"{root}/products.json", {"limit": 250, "page": page})
+        if not isinstance(data, dict) or "products" not in data:
+            break
+        is_shopify = True
+        for p in data["products"]:
+            tags = p.get("tags", [])
+            tags = " ".join(tags) if isinstance(tags, list) else str(tags)
+            if not matches(f"{p.get('title', '')} {p.get('handle', '')} "
+                           f"{p.get('product_type', '')} {tags}", keywords):
+                continue
+            for v in p.get("variants", []):
+                variant = "" if v.get("title") == "Default Title" else (v.get("title") or "")
+                weight = parse_weight_kg(variant) or parse_weight_kg(p.get("title"))
+                if not weight and v.get("grams"):
+                    weight = v["grams"] / 1000
+                rows.append({"product": p.get("title", ""), "variant": variant,
+                             "price": to_number(v.get("price")), "available": v.get("available"),
+                             "weight_kg": weight, "url": f"{root}/products/{p.get('handle')}",
+                             "method": "Shopify"})
+        if len(data["products"]) < 250:
+            break
+    return rows if is_shopify else None
+
+
+def scan_woocommerce(root, keywords):
+    """متاجر WooCommerce (ووردبريس): واجهة Store API العامة"""
+    endpoint = None
+    for ep in ("/wp-json/wc/store/v1/products", "/wp-json/wc/store/products"):
+        if isinstance(get_json(root + ep, {"per_page": 1}), list):
+            endpoint = root + ep
+            break
+    if not endpoint:
+        return None
+    rows = []
+    for page in range(1, 6):
+        data = get_json(endpoint, {"per_page": 100, "page": page})
+        if not isinstance(data, list) or not data:
+            break
+        for p in data:
+            name = html.unescape(p.get("name", ""))
+            cats = " ".join(c.get("name", "") for c in p.get("categories", []))
+            if not matches(f"{name} {p.get('slug', '')} {cats}", keywords):
+                continue
+            prices = p.get("prices", {})
+            price = to_number(prices.get("price"))
+            if price is not None:
+                price = price / 10 ** int(prices.get("currency_minor_unit", 0) or 0)
+            rows.append({"product": name, "variant": "", "price": price,
+                         "available": p.get("is_in_stock"), "weight_kg": parse_weight_kg(name),
+                         "url": p.get("permalink", root), "method": "WooCommerce"})
+        if len(data) < 100:
+            break
+    return rows
+
+
+LOC_RE = re.compile(r"<loc>\s*(.*?)\s*</loc>", re.I | re.S)
+
+
+def sitemap_urls(root):
+    """يقرأ خريطة الموقع (sitemap) ويجمع كل روابط الصفحات."""
+    queue = [f"{root}/sitemap.xml", f"{root}/sitemap_index.xml"]
+    try:
+        robots = requests.get(f"{root}/robots.txt", headers=HEADERS, timeout=TIMEOUT).text
+        queue = re.findall(r"(?im)^sitemap:\s*(\S+)", robots) + queue
+    except Exception:
+        pass
+    seen, pages, fetched = set(), [], 0
+    while queue and fetched < 15:
+        sm = queue.pop(0)
+        if sm in seen:
+            continue
+        seen.add(sm)
+        fetched += 1
+        try:
+            r = requests.get(sm, headers=HEADERS, timeout=TIMEOUT)
+            if r.status_code != 200:
+                continue
+        except Exception:
+            continue
+        for loc in LOC_RE.findall(r.text):
+            loc = html.unescape(loc)
+            if re.search(r"\.xml(\.gz)?(\?|$)", loc):
+                (queue.insert(0, loc) if "product" in loc.lower() else queue.append(loc))
+            else:
+                pages.append(loc)
+    return list(dict.fromkeys(pages))
+
+
+def search_page_links(root, keywords):
+    """الحل الأخير: نستخدم صفحة البحث في الموقع نفسه."""
+    links = []
+    for kw in keywords or ["عسل"]:
+        for path in (f"/search?q={kw}", f"/?s={kw}&post_type=product", f"/search?type=product&q={kw}"):
+            try:
+                r = requests.get(root + path, headers=HEADERS, timeout=TIMEOUT)
+                if r.status_code != 200:
+                    continue
+                r.encoding = r.apparent_encoding or "utf-8"
+            except Exception:
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = urljoin(root, a["href"]).split("#")[0]
+                if (urlparse(href).netloc == urlparse(root).netloc
+                        and "search" not in href and "?s=" not in href
+                        and re.search(r"/products?/", href)
+                        and matches(href + " " + a.get_text(" "), keywords)):
+                    links.append(href)
+            if links:
+                return list(dict.fromkeys(links))
+    return []
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def scan_site(url, keywords, max_pages, exclude=()):
+    """يبحث عن منتجات العسل في الموقع كله ويعيد أسعارها."""
+    if not url.startswith("http"):
+        url = "https://" + url
+    root = site_root(url)
+    keywords = [k.lower() for k in keywords]
+    EXCLUDE[:] = [x.lower() for x in exclude]
+
+    # رابط منتج مباشر ما زال مقبولاً
+    if re.search(r"/products?/[^/]+", urlparse(url).path):
+        return scrape_product(url)
+
+    rows = scan_shopify(root, keywords)
+    if rows is None:
+        rows = scan_woocommerce(root, keywords)
+    if rows is None:
+        pages = [u for u in sitemap_urls(root) if matches(u, keywords)]
+        if not pages:
+            pages = search_page_links(root, keywords)
+        pages = pages[:max_pages]
+        rows = []
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for res in ex.map(scrape_product, pages):
+                rows.extend(r for r in res if r.get("price"))
+
+    if not rows:
+        return [{**base_row(root), "error": "لم أجد منتجات مطابقة في هذا الموقع"}]
+    return [{**base_row(r.get("url", root)), **r} for r in rows]
+
+
+# ------------------------------------------------------------------ حفظ البيانات
+def load_urls():
+    if os.path.exists(URLS_FILE):
+        with open(URLS_FILE, encoding="utf-8") as f:
+            return f.read()
+    return ""
+
+
+def save_urls(text):
+    with open(URLS_FILE, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def append_history(df):
+    snap = df.dropna(subset=["price"]).copy()
+    snap.insert(0, "date", datetime.date.today().isoformat())
+    snap = snap[["date", "site", "product", "variant", "price", "weight_kg", "price_per_kg", "url"]]
+    if os.path.exists(HISTORY_FILE):
+        old = pd.read_csv(HISTORY_FILE)
+        snap = pd.concat([old, snap]).drop_duplicates(
+            subset=["date", "url", "variant"], keep="last")
+    snap.to_csv(HISTORY_FILE, index=False, encoding="utf-8-sig")
+    return snap
+
+
+# ------------------------------------------------------------------ الواجهة
+st.set_page_config(page_title="مقارنة أسعار العسل", page_icon="🍯", layout="wide")
+st.markdown(
+    """<style>
+    .stApp, .stMarkdown, .stTextArea, .stButton, h1, h2, h3, p, label {direction: rtl; text-align: right;}
+    textarea, [data-testid="stDataFrame"] {direction: ltr; text-align: left;}
+    </style>""",
+    unsafe_allow_html=True,
+)
+
+st.title("🍯 مقارنة أسعار العسل")
+st.caption("ضع رابط كل متجر في سطر، وسيبحث التطبيق داخل المتجر عن منتجات العسل ويقارن سعر الكيلو.")
+
+urls_text = st.text_area("روابط المتاجر", value=load_urls(), height=150,
+                         placeholder="https://honey-store.com")
+with st.expander("⚙️ إعدادات البحث"):
+    kw_text = st.text_input("كلمات البحث (افصل بينها بفاصلة)", value="عسل, honey")
+    ex_text = st.text_input("استبعد المنتجات التي تحتوي على",
+                            value="شمع, صابون, كريم, شامبو, ماسك, حلاوة, بسكويت")
+    max_pages = st.slider("أقصى عدد صفحات يُفحص في المواقع غير المعروفة", 10, 150, 50)
+def split_words(text):
+    return tuple(w.strip() for w in text.replace("،", ",").split(",") if w.strip())
+
+
+keywords, exclude = split_words(kw_text), split_words(ex_text)
+
+c1, c2 = st.columns([1, 1])
+run = c1.button("🔍 استخراج الأسعار", type="primary", use_container_width=True)
+if c2.button("🔄 تحديث (تجاهل الذاكرة المؤقتة)", use_container_width=True):
+    scan_site.clear()
+    run = True
+
+if run:
+    urls = [u.strip() for u in urls_text.splitlines() if u.strip().startswith("http")]
+    if not urls:
+        st.warning("أضف رابط متجر واحد على الأقل يبدأ بـ http")
+        st.stop()
+    save_urls("\n".join(urls))
+
+    results, bar = [], st.progress(0.0, text="جاري البحث في المتاجر...")
+    for i, url in enumerate(urls, 1):
+        bar.progress((i - 1) / len(urls), text=f"جاري البحث في {urlparse(url).netloc} ({i} من {len(urls)})")
+        results.extend(scan_site(url, keywords, max_pages, exclude))
+    bar.empty()
+
+    df = pd.DataFrame(results)
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["weight_kg"] = pd.to_numeric(df["weight_kg"], errors="coerce")
+    df["price_per_kg"] = (df["price"] / df["weight_kg"]).round(1)
+    df = df.sort_values(["price_per_kg", "price"], na_position="last")
+    st.session_state["df"] = df
+    st.session_state["history"] = append_history(df)
+
+df = st.session_state.get("df")
+if df is not None:
+    ok = df[df["price"].notna()]
+    ranked = ok[ok["price_per_kg"].notna() & (ok["available"] != False)]  # noqa: E712
+    if not ranked.empty:
+        best = ranked.iloc[0]
+        st.success(f"أفضل سعر للكيلو: **{best['price_per_kg']:,.0f} ج.م** — "
+                   f"{best['product']} {best['variant']} ({best['site']})")
+
+    found = ok.groupby("site").size()
+    st.subheader(f"النتائج — {len(ok)} منتج من {len(found)} متجر")
+    st.dataframe(
+        df[["site", "product", "variant", "price", "weight_kg", "price_per_kg",
+            "available", "url", "method", "error"]],
+        use_container_width=True, hide_index=True,
+        column_config={
+            "site": "الموقع", "product": "المنتج", "variant": "الحجم",
+            "price": st.column_config.NumberColumn("السعر (ج.م)", format="%.0f"),
+            "weight_kg": st.column_config.NumberColumn("الوزن (كجم)", format="%.2f"),
+            "price_per_kg": st.column_config.NumberColumn("سعر الكيلو", format="%.0f"),
+            "available": "متوفر؟",
+            "url": st.column_config.LinkColumn("رابط الطلب", display_text="اطلب"),
+            "method": "طريقة الاستخراج", "error": "ملاحظات",
+        },
+    )
+    if ok["weight_kg"].isna().any():
+        st.info("بعض المنتجات بلا وزن مكتوب في الاسم، لذلك لا يظهر لها سعر الكيلو.")
+
+hist = st.session_state.get("history")
+if hist is None and os.path.exists(HISTORY_FILE):
+    hist = pd.read_csv(HISTORY_FILE)
+if hist is not None and not hist.empty:
+    st.subheader("📈 تغيّر سعر الكيلو مع الوقت")
+    h = hist.dropna(subset=["price_per_kg"]).copy()
+    if h["date"].nunique() > 1:
+        h["label"] = h["site"] + " — " + h["product"].str[:30] + " " + h["variant"].fillna("")
+        st.line_chart(h.pivot_table(index="date", columns="label", values="price_per_kg"))
+    else:
+        st.caption("سيظهر الرسم البياني بعد تشغيل التطبيق في أكثر من يوم.")
+    st.download_button("⬇️ تحميل سجل الأسعار (CSV)",
+                       hist.to_csv(index=False).encode("utf-8-sig"),
+                       "honey_prices_history.csv", "text/csv")
