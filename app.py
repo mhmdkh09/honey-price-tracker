@@ -228,8 +228,16 @@ def site_root(url):
 EXCLUDE = []  # تُملأ من الواجهة
 
 
-def matches(text, keywords):
+def normalize(text):
+    """يوحّد الكتابة العربية: ى/ي، ة/ه، أ/إ/آ/ا، ويحذف التشكيل."""
     t = unquote(str(text)).lower()
+    t = re.sub(r"[\u064B-\u0652\u0640]", "", t)
+    return (t.replace("ى", "ي").replace("ة", "ه")
+            .replace("أ", "ا").replace("إ", "ا").replace("آ", "ا"))
+
+
+def matches(text, keywords):
+    t = normalize(text)
     if any(x in t for x in EXCLUDE):
         return False
     return not keywords or any(k in t for k in keywords)
@@ -366,8 +374,8 @@ def scan_site(url, keywords, max_pages, exclude=()):
     if not url.startswith("http"):
         url = "https://" + url
     root = site_root(url)
-    keywords = [k.lower() for k in keywords]
-    EXCLUDE[:] = [x.lower() for x in exclude]
+    keywords = [normalize(k) for k in keywords]
+    EXCLUDE[:] = [normalize(x) for x in exclude]
 
     # رابط منتج مباشر ما زال مقبولاً
     if re.search(r"/products?/[^/]+", urlparse(url).path):
@@ -404,30 +412,52 @@ def save_urls(text):
         f.write(text)
 
 
+# الترتيب مهم: الأصناف الأدق أولاً
 HONEY_TYPES = [
+    ("كشميري", ["كشميري", "kashmir"]),
+    ("دوعني", ["دوعني", "دوعن", "dawani", "doani", "dawan"]),
+    ("حضرمي", ["حضرمي", "hadrami"]),
+    ("سدر سعودي / يمني", ["سعودي", "يمني", "saudi", "yemen"]),
     ("سدر", ["سدر", "sidr", "sidir"]),
     ("مانوكا", ["مانوكا", "manuka"]),
-    ("سمر", ["سمر ", "سمرة", "samar"]),
+    ("سمر", ["سمر ", "سمره", "samar"]),
     ("طلح", ["طلح", "talh"]),
-    ("حبة البركة", ["حبة البركة", "حبه البركه", "حبة البركه", "black seed", "nigella"]),
+    ("حبة البركة", ["حبه البركه", "black seed", "nigella"]),
+    ("بردقوش", ["بردقوش", "مردقوش", "marjoram"]),
     ("موالح", ["موالح", "برتقال", "حمضيات", "citrus", "orange"]),
     ("برسيم", ["برسيم", "clover"]),
     ("قطن", ["قطن", "cotton"]),
     ("كينا", ["كينا", "كافور", "eucalyptus"]),
     ("زعتر", ["زعتر", "thyme"]),
     ("زهور برية", ["زهور", "wildflower", "wild flower", "multiflora"]),
-    ("عسل بالشمع", ["بالشمع", "شهد", "قرص", "comb"]),
+    ("عسل شمع", ["شمع", "شهد", "قرص", "comb"]),
     ("جبلي", ["جبلي", "mountain"]),
 ]
+# منتجات مخلوطة (عسل + إضافات) تظهر باسمها حتى لا تُحسب ضمن صنف آخر
+MIX_WORDS = ["غذاء الملكات", "حبوب اللقاح", "طلع النخيل", "مكسرات", "خلطه",
+             "royal jelly", "pollen", "ginseng", "جنسنج"]
 
 
-def honey_type(text):
+def clean_name(name):
+    """اسم المنتج بدون الوزن والكلمات العامة، ليُستخدم كصنف إذا لم يكن معروفاً."""
+    t = str(name).translate(AR_DIGITS)
+    t = WEIGHT_RE.sub("", t)
+    t = re.sub(r"[()\[\]\-–|/]+", " ", t)
+    t = re.sub(r"\b(honey|bee|natural|pure)\b", "", t, flags=re.I)
+    t = re.sub(r"(^|\s)(عسل|نحل|طبيعي|اصلي|أصلي)(?=\s|$)", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return f"عسل {t}" if t else "عسل نحل (غير محدد الصنف)"
+
+
+def honey_type(product, variant=""):
     """يحدد صنف العسل من اسم المنتج."""
-    t = f" {str(text).lower()} "
+    t = f" {normalize(product)} {normalize(variant)} "
+    if any(normalize(w) in t for w in MIX_WORDS):
+        return clean_name(product)
     for name, words in HONEY_TYPES:
-        if any(w in t for w in words):
+        if any(normalize(w) in t for w in words):
             return name
-    return "عسل نحل (غير محدد الصنف)"
+    return clean_name(product)
 
 
 def summarize(df):
@@ -438,11 +468,11 @@ def summarize(df):
     d = d[d["price"].notna() & d["weight_kg"].notna() & (d["weight_kg"] > 0)
           & (d["available"] != False)]  # noqa: E712
     if d.empty:
-        return pd.DataFrame(columns=["type", "site", "price_per_kg"])
+        return pd.DataFrame(columns=["type", "site", "product", "price_per_kg"])
     d["price_per_kg"] = (d["price"] / d["weight_kg"]).round(0)
-    d["type"] = (d["product"].fillna("") + " " + d["variant"].fillna("")).map(honey_type)
-    return (d.groupby(["type", "site"], as_index=False)["price_per_kg"].min()
-            .sort_values("price_per_kg"))
+    d["type"] = [honey_type(p, v) for p, v in zip(d["product"].fillna(""), d["variant"].fillna(""))]
+    d = d.sort_values("price_per_kg").drop_duplicates(["type", "site"])
+    return d[["type", "site", "product", "price_per_kg"]]
 
 
 def append_history(table):
@@ -475,7 +505,7 @@ urls_text = st.text_area("روابط المتاجر", value=load_urls(), height=
 with st.expander("⚙️ إعدادات البحث"):
     kw_text = st.text_input("كلمات البحث (افصل بينها بفاصلة)", value="عسل, honey")
     ex_text = st.text_input("استبعد المنتجات التي تحتوي على",
-                            value="شمع, صابون, كريم, شامبو, ماسك, حلاوة, بسكويت")
+                            value="صابون, كريم, شامبو, ماسك, حلاوة, بسكويت, للشعر, للبشرة")
     max_pages = st.slider("أقصى عدد صفحات يُفحص في المواقع غير المعروفة", 10, 150, 50)
 def split_words(text):
     return tuple(w.strip() for w in text.replace("،", ",").split(",") if w.strip())
@@ -506,6 +536,9 @@ if run:
     st.session_state["errors"] = df[df["error"].astype(bool)]["site"].unique().tolist()
     st.session_state["no_weight"] = 0
     table = summarize(df)
+    sold = df[df["available"] == False]  # noqa: E712
+    sold_types = {honey_type(p, v) for p, v in zip(sold["product"].fillna(""), sold["variant"].fillna(""))}
+    st.session_state["sold_out"] = sorted(sold_types - set(table["type"]))
     st.session_state["table"] = table
     st.session_state["no_weight"] = int(
         (pd.to_numeric(df["price"], errors="coerce").notna()
@@ -522,12 +555,13 @@ if table is not None:
                 .sort_values("price_per_kg"))
         st.subheader("🍯 أفضل سعر للكيلو لكل صنف")
         st.dataframe(
-            best[["type", "price_per_kg", "site"]],
+            best[["type", "price_per_kg", "site", "product"]],
             use_container_width=True, hide_index=True,
             column_config={
                 "type": "صنف العسل",
                 "price_per_kg": st.column_config.NumberColumn("سعر الكيلو (ج.م)", format="%.0f"),
                 "site": "المتجر",
+                "product": "اسم المنتج في المتجر",
             },
         )
 
@@ -540,6 +574,8 @@ if table is not None:
                          .highlight_min(axis=1, color="#c8e6c9"),
                          use_container_width=True)
 
+    if st.session_state.get("sold_out"):
+        st.caption("أصناف وجدتها لكنها غير متوفرة حالياً: " + "، ".join(st.session_state["sold_out"]))
     if st.session_state.get("errors"):
         st.caption("لم أجد أسعاراً في: " + "، ".join(st.session_state["errors"]))
     if st.session_state.get("no_weight"):
