@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 urls.txt
 prices_history.csv
+search_history.json

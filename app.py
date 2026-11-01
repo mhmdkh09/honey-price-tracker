@@ -24,7 +24,9 @@ HEADERS = {
     "Accept-Language": "ar,en;q=0.9",
 }
 TIMEOUT = 20
-URLS_FILE = "urls.txt"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+SEARCHES_FILE = os.path.join(APP_DIR, "search_history.json")  # يُحفظ تلقائياً عند كل بحث
+STORES_FILE = os.path.join(APP_DIR, "stores.txt")             # قائمة دائمة داخل GitHub
 HISTORY_FILE = "prices_history.csv"
 
 AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩٫٬", "0123456789.,")
@@ -400,16 +402,60 @@ def scan_site(url, keywords, max_pages, exclude=()):
 
 
 # ------------------------------------------------------------------ حفظ البيانات
-def load_urls():
-    if os.path.exists(URLS_FILE):
-        with open(URLS_FILE, encoding="utf-8") as f:
-            return f.read()
-    return ""
+def clean_store_url(url):
+    """رابط المتجر الرئيسي، أو رابط المنتج كما هو إذا كان رابط منتج."""
+    url = url.strip().rstrip("/")
+    if not url.startswith("http"):
+        url = "https://" + url
+    p = urlparse(url)
+    if re.search(r"/products?/[^/]+", p.path):
+        return url
+    return f"{p.scheme}://{p.netloc.lower()}"
 
 
-def save_urls(text):
-    with open(URLS_FILE, "w", encoding="utf-8") as f:
-        f.write(text)
+def load_searches():
+    try:
+        with open(SEARCHES_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    data.setdefault("stores", {})
+    data.setdefault("last", [])
+    return data
+
+
+def save_searches(urls):
+    data = load_searches()
+    today = datetime.date.today().isoformat()
+    for u in urls:
+        info = data["stores"].get(u, {"count": 0})
+        data["stores"][u] = {"count": info["count"] + 1, "last_used": today}
+    data["last"] = urls
+    try:
+        with open(SEARCHES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def previous_stores():
+    """المتاجر السابقة: الأحدث استخداماً أولاً، ثم القائمة الدائمة."""
+    data = load_searches()
+    recent = sorted(data["stores"], key=lambda u: (data["stores"][u].get("last_used", ""),
+                                                    data["stores"][u].get("count", 0)),
+                    reverse=True)
+    permanent = []
+    if os.path.exists(STORES_FILE):
+        with open(STORES_FILE, encoding="utf-8") as f:
+            permanent = [clean_store_url(l) for l in f
+                         if l.strip() and not l.strip().startswith("#")]
+    return list(dict.fromkeys(recent + permanent)), data["last"]
+
+
+def store_label(url):
+    p = urlparse(url)
+    name = p.netloc.replace("www.", "")
+    return name if p.path in ("", "/") else f"{name} — {unquote(p.path)[:40]}"
 
 
 # الترتيب مهم: الأصناف الأدق أولاً
@@ -500,7 +546,15 @@ st.markdown(
 st.title("🍯 مقارنة أسعار العسل")
 st.caption("ضع رابط كل متجر في سطر، وسيبحث التطبيق عن أصناف العسل ويحسب سعر الكيلو لكل صنف، حتى لو كانت العبوة أصغر من كيلو.")
 
-urls_text = st.text_area("روابط المتاجر", value=load_urls(), height=150,
+stores, last_used = previous_stores()
+selected = st.multiselect(
+    "🕘 متاجر بحثت فيها من قبل",
+    options=stores,
+    default=[u for u in last_used if u in stores],
+    format_func=store_label,
+    placeholder="اختر من المتاجر السابقة..." if stores else "لا توجد عمليات بحث سابقة بعد",
+)
+urls_text = st.text_area("➕ أضف روابط متاجر جديدة (رابط في كل سطر)", height=100,
                          placeholder="https://honey-store.com")
 with st.expander("⚙️ إعدادات البحث"):
     kw_text = st.text_input("كلمات البحث (افصل بينها بفاصلة)", value="عسل, honey")
@@ -520,11 +574,13 @@ if c2.button("🔄 تحديث (تجاهل الذاكرة المؤقتة)", use_c
     run = True
 
 if run:
-    urls = [u.strip() for u in urls_text.splitlines() if u.strip().startswith("http")]
+    new = [clean_store_url(u) for u in urls_text.splitlines()
+           if "." in u.strip() or u.strip().startswith("http")]
+    urls = list(dict.fromkeys(selected + new))
     if not urls:
-        st.warning("أضف رابط متجر واحد على الأقل يبدأ بـ http")
+        st.warning("اختر متجراً من القائمة أو أضف رابط متجر جديد")
         st.stop()
-    save_urls("\n".join(urls))
+    save_searches(urls)
 
     results, bar = [], st.progress(0.0, text="جاري البحث في المتاجر...")
     for i, url in enumerate(urls, 1):
