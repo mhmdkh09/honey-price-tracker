@@ -404,14 +404,55 @@ def save_urls(text):
         f.write(text)
 
 
-def append_history(df):
-    snap = df.dropna(subset=["price"]).copy()
+HONEY_TYPES = [
+    ("سدر", ["سدر", "sidr", "sidir"]),
+    ("مانوكا", ["مانوكا", "manuka"]),
+    ("سمر", ["سمر ", "سمرة", "samar"]),
+    ("طلح", ["طلح", "talh"]),
+    ("حبة البركة", ["حبة البركة", "حبه البركه", "حبة البركه", "black seed", "nigella"]),
+    ("موالح", ["موالح", "برتقال", "حمضيات", "citrus", "orange"]),
+    ("برسيم", ["برسيم", "clover"]),
+    ("قطن", ["قطن", "cotton"]),
+    ("كينا", ["كينا", "كافور", "eucalyptus"]),
+    ("زعتر", ["زعتر", "thyme"]),
+    ("زهور برية", ["زهور", "wildflower", "wild flower", "multiflora"]),
+    ("عسل بالشمع", ["بالشمع", "شهد", "قرص", "comb"]),
+    ("جبلي", ["جبلي", "mountain"]),
+]
+
+
+def honey_type(text):
+    """يحدد صنف العسل من اسم المنتج."""
+    t = f" {str(text).lower()} "
+    for name, words in HONEY_TYPES:
+        if any(w in t for w in words):
+            return name
+    return "عسل نحل (غير محدد الصنف)"
+
+
+def summarize(df):
+    """يحوّل المنتجات إلى جدول: صنف العسل + المتجر + أقل سعر للكيلو."""
+    d = df.copy()
+    d["price"] = pd.to_numeric(d["price"], errors="coerce")
+    d["weight_kg"] = pd.to_numeric(d["weight_kg"], errors="coerce")
+    d = d[d["price"].notna() & d["weight_kg"].notna() & (d["weight_kg"] > 0)
+          & (d["available"] != False)]  # noqa: E712
+    if d.empty:
+        return pd.DataFrame(columns=["type", "site", "price_per_kg"])
+    d["price_per_kg"] = (d["price"] / d["weight_kg"]).round(0)
+    d["type"] = (d["product"].fillna("") + " " + d["variant"].fillna("")).map(honey_type)
+    return (d.groupby(["type", "site"], as_index=False)["price_per_kg"].min()
+            .sort_values("price_per_kg"))
+
+
+def append_history(table):
+    snap = table.copy()
     snap.insert(0, "date", datetime.date.today().isoformat())
-    snap = snap[["date", "site", "product", "variant", "price", "weight_kg", "price_per_kg", "url"]]
     if os.path.exists(HISTORY_FILE):
         old = pd.read_csv(HISTORY_FILE)
-        snap = pd.concat([old, snap]).drop_duplicates(
-            subset=["date", "url", "variant"], keep="last")
+        if "type" in old.columns:
+            snap = pd.concat([old, snap]).drop_duplicates(
+                subset=["date", "type", "site"], keep="last")
     snap.to_csv(HISTORY_FILE, index=False, encoding="utf-8-sig")
     return snap
 
@@ -427,7 +468,7 @@ st.markdown(
 )
 
 st.title("🍯 مقارنة أسعار العسل")
-st.caption("ضع رابط كل متجر في سطر، وسيبحث التطبيق داخل المتجر عن منتجات العسل ويقارن سعر الكيلو.")
+st.caption("ضع رابط كل متجر في سطر، وسيبحث التطبيق عن أصناف العسل ويحسب سعر الكيلو لكل صنف، حتى لو كانت العبوة أصغر من كيلو.")
 
 urls_text = st.text_area("روابط المتاجر", value=load_urls(), height=150,
                          placeholder="https://honey-store.com")
@@ -462,50 +503,57 @@ if run:
     bar.empty()
 
     df = pd.DataFrame(results)
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
-    df["weight_kg"] = pd.to_numeric(df["weight_kg"], errors="coerce")
-    df["price_per_kg"] = (df["price"] / df["weight_kg"]).round(1)
-    df = df.sort_values(["price_per_kg", "price"], na_position="last")
-    st.session_state["df"] = df
-    st.session_state["history"] = append_history(df)
+    st.session_state["errors"] = df[df["error"].astype(bool)]["site"].unique().tolist()
+    st.session_state["no_weight"] = 0
+    table = summarize(df)
+    st.session_state["table"] = table
+    st.session_state["no_weight"] = int(
+        (pd.to_numeric(df["price"], errors="coerce").notna()
+         & pd.to_numeric(df["weight_kg"], errors="coerce").isna()).sum())
+    st.session_state["history"] = append_history(table)
 
-df = st.session_state.get("df")
-if df is not None:
-    ok = df[df["price"].notna()]
-    ranked = ok[ok["price_per_kg"].notna() & (ok["available"] != False)]  # noqa: E712
-    if not ranked.empty:
-        best = ranked.iloc[0]
-        st.success(f"أفضل سعر للكيلو: **{best['price_per_kg']:,.0f} ج.م** — "
-                   f"{best['product']} {best['variant']} ({best['site']})")
+table = st.session_state.get("table")
+if table is not None:
+    if table.empty:
+        st.warning("لم أستطع حساب سعر الكيلو لأي صنف في هذه المتاجر.")
+    else:
+        best = (table.sort_values("price_per_kg")
+                .groupby("type", as_index=False).first()
+                .sort_values("price_per_kg"))
+        st.subheader("🍯 أفضل سعر للكيلو لكل صنف")
+        st.dataframe(
+            best[["type", "price_per_kg", "site"]],
+            use_container_width=True, hide_index=True,
+            column_config={
+                "type": "صنف العسل",
+                "price_per_kg": st.column_config.NumberColumn("سعر الكيلو (ج.م)", format="%.0f"),
+                "site": "المتجر",
+            },
+        )
 
-    found = ok.groupby("site").size()
-    st.subheader(f"النتائج — {len(ok)} منتج من {len(found)} متجر")
-    st.dataframe(
-        df[["site", "product", "variant", "price", "weight_kg", "price_per_kg",
-            "available", "url", "method", "error"]],
-        use_container_width=True, hide_index=True,
-        column_config={
-            "site": "الموقع", "product": "المنتج", "variant": "الحجم",
-            "price": st.column_config.NumberColumn("السعر (ج.م)", format="%.0f"),
-            "weight_kg": st.column_config.NumberColumn("الوزن (كجم)", format="%.2f"),
-            "price_per_kg": st.column_config.NumberColumn("سعر الكيلو", format="%.0f"),
-            "available": "متوفر؟",
-            "url": st.column_config.LinkColumn("رابط الطلب", display_text="اطلب"),
-            "method": "طريقة الاستخراج", "error": "ملاحظات",
-        },
-    )
-    if ok["weight_kg"].isna().any():
-        st.info("بعض المنتجات بلا وزن مكتوب في الاسم، لذلك لا يظهر لها سعر الكيلو.")
+        if table["site"].nunique() > 1:
+            st.subheader("المقارنة بين المتاجر (سعر الكيلو بالجنيه)")
+            pivot = table.pivot_table(index="type", columns="site",
+                                      values="price_per_kg", aggfunc="min")
+            pivot = pivot.loc[pivot.min(axis=1).sort_values().index]
+            st.dataframe(pivot.style.format("{:,.0f}", na_rep="—")
+                         .highlight_min(axis=1, color="#c8e6c9"),
+                         use_container_width=True)
+
+    if st.session_state.get("errors"):
+        st.caption("لم أجد أسعاراً في: " + "، ".join(st.session_state["errors"]))
+    if st.session_state.get("no_weight"):
+        st.caption(f"تم تجاهل {st.session_state['no_weight']} منتج لأن وزنه غير مكتوب، "
+                   "فلا يمكن حساب سعر الكيلو له.")
 
 hist = st.session_state.get("history")
 if hist is None and os.path.exists(HISTORY_FILE):
     hist = pd.read_csv(HISTORY_FILE)
-if hist is not None and not hist.empty:
-    st.subheader("📈 تغيّر سعر الكيلو مع الوقت")
-    h = hist.dropna(subset=["price_per_kg"]).copy()
-    if h["date"].nunique() > 1:
-        h["label"] = h["site"] + " — " + h["product"].str[:30] + " " + h["variant"].fillna("")
-        st.line_chart(h.pivot_table(index="date", columns="label", values="price_per_kg"))
+if hist is not None and not hist.empty and "type" in hist.columns:
+    st.subheader("📈 تغيّر أفضل سعر للكيلو مع الوقت")
+    if hist["date"].nunique() > 1:
+        st.line_chart(hist.pivot_table(index="date", columns="type",
+                                       values="price_per_kg", aggfunc="min"))
     else:
         st.caption("سيظهر الرسم البياني بعد تشغيل التطبيق في أكثر من يوم.")
     st.download_button("⬇️ تحميل سجل الأسعار (CSV)",
