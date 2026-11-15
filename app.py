@@ -533,6 +533,99 @@ def append_history(table):
     return snap
 
 
+# ------------------------------------------------------------------ البحث في جوجل
+# مواقع ليست متاجر، لا داعي لإضافتها
+NOT_STORES = ("facebook.", "instagram.", "youtube.", "youtu.be", "tiktok.", "twitter.", "x.com",
+              "wikipedia.", "linkedin.", "pinterest.", "reddit.", "quora.", "google.",
+              "masrawy.", "youm7.", "elwatannews.", "almasryalyoum.", "webteb.", "altibbi.",
+              "mawdoo3.", "sayidaty.", "supermama.", "kitchen", "cookpad.")
+
+
+def get_secret(name):
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        value = None
+    return value or os.environ.get(name)
+
+
+def search_google(query, num=20):
+    """نتائج جوجل عبر Serper.dev (يحتاج مفتاح SERPER_API_KEY)."""
+    r = requests.post("https://google.serper.dev/search",
+                      headers={"X-API-KEY": get_secret("SERPER_API_KEY"),
+                               "Content-Type": "application/json"},
+                      json={"q": query, "gl": "eg", "hl": "ar", "num": num},
+                      timeout=TIMEOUT)
+    r.raise_for_status()
+    return [{"title": o.get("title", ""), "link": o.get("link", ""),
+             "snippet": o.get("snippet", "")} for o in r.json().get("organic", [])]
+
+
+def search_duckduckgo(query, num=20):
+    """بديل مجاني بدون مفتاح (نتائج DuckDuckGo وليست جوجل)."""
+    from ddgs import DDGS
+    return [{"title": o.get("title", ""), "link": o.get("href", ""),
+             "snippet": o.get("body", "")}
+            for o in DDGS().text(query, region="xa-ar", max_results=num)]
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def web_search(query, num=20):
+    """يرجع (النتائج، المصدر، رسالة خطأ)."""
+    if get_secret("SERPER_API_KEY"):
+        try:
+            return search_google(query, num), "Google", ""
+        except Exception as e:
+            error = f"تعذّر البحث في جوجل: {e}"
+    else:
+        error = ""
+    try:
+        return search_duckduckgo(query, num), "DuckDuckGo", error
+    except Exception as e:
+        return [], "", (error + " — " if error else "") + f"تعذّر البحث: {e}"
+
+
+def group_by_store(results):
+    """يجمع النتائج حسب المتجر ويستبعد المواقع التي ليست متاجر."""
+    stores = {}
+    for r in results:
+        link = r.get("link", "")
+        if not link.startswith("http"):
+            continue
+        host = urlparse(link).netloc.lower()
+        if any(x in host for x in NOT_STORES):
+            continue
+        root = clean_store_url(f"{urlparse(link).scheme}://{host}")
+        stores.setdefault(root, []).append(r)
+    return stores
+
+
+def add_stores(urls):
+    """يضيف المتاجر لقائمة المتاجر السابقة ويختارها للبحث القادم."""
+    data = load_searches()
+    today = datetime.date.today().isoformat()
+    for u in urls:
+        data["stores"].setdefault(u, {"count": 0, "last_used": today})
+        data["stores"][u]["last_used"] = today
+    try:
+        with open(SEARCHES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+    chosen = st.session_state.get("stores_sel", [])
+    st.session_state["stores_sel"] = list(dict.fromkeys(chosen + list(urls)))
+
+
+def on_add_from_search():
+    picked = [u for u in st.session_state.get("search_stores", {})
+              if st.session_state.get(f"pick_{u}")]
+    if picked:
+        add_stores(picked)
+        st.session_state["search_msg"] = f"تمت إضافة {len(picked)} متجر إلى قائمة البحث ✅"
+        for u in picked:
+            st.session_state[f"pick_{u}"] = False
+
+
 # ------------------------------------------------------------------ الواجهة
 st.set_page_config(page_title="مقارنة أسعار العسل", page_icon="🍯", layout="wide")
 st.markdown(
@@ -546,11 +639,49 @@ st.markdown(
 st.title("🍯 مقارنة أسعار العسل")
 st.caption("ضع رابط كل متجر في سطر، وسيبحث التطبيق عن أصناف العسل ويحسب سعر الكيلو لكل صنف، حتى لو كانت العبوة أصغر من كيلو.")
 
+with st.expander("🔎 ابحث في جوجل عن متاجر عسل جديدة", expanded=False):
+    with st.form("google_search", border=False):
+        q = st.text_input("ماذا تريد أن تبحث؟", value="عسل سدر طبيعي سعر الكيلو",
+                          placeholder="مثال: عسل بردقوش اونلاين")
+        go = st.form_submit_button("🔎 بحث", use_container_width=True)
+    if go and q.strip():
+        with st.spinner("جاري البحث..."):
+            results, source, err = web_search(q.strip())
+        st.session_state["search_stores"] = group_by_store(results)
+        st.session_state["search_info"] = (source, err, len(results))
+        st.session_state.pop("search_msg", None)
+
+    found = st.session_state.get("search_stores")
+    if found is not None:
+        source, err, n = st.session_state["search_info"]
+        if err:
+            st.warning(err)
+        if source == "DuckDuckGo":
+            st.caption("النتائج من DuckDuckGo لأن مفتاح جوجل (SERPER_API_KEY) غير مضاف بعد.")
+        if not found:
+            st.info("لم أجد متاجر في النتائج. جرّب كلمات أخرى.")
+        else:
+            st.caption(f"وجدت {len(found)} موقع من {n} نتيجة. اختر المتاجر التي تريد مقارنة أسعارها:")
+            known = set(previous_stores()[0])
+            for root, items in found.items():
+                top = items[0]
+                label = f"**{store_label(root)}** — {top['title'][:80]}"
+                if root in known:
+                    label += "  ·  _موجود في قائمتك_"
+                st.checkbox(label, key=f"pick_{root}", help=top.get("snippet", "")[:300])
+            st.button("➕ أضف المتاجر المختارة للمقارنة", type="primary",
+                      on_click=on_add_from_search, use_container_width=True)
+        if st.session_state.get("search_msg"):
+            st.success(st.session_state["search_msg"])
+
 stores, last_used = previous_stores()
+if "stores_sel" not in st.session_state:
+    st.session_state["stores_sel"] = [u for u in last_used if u in stores]
+st.session_state["stores_sel"] = [u for u in st.session_state["stores_sel"] if u in stores]
 selected = st.multiselect(
     "🕘 متاجر بحثت فيها من قبل",
     options=stores,
-    default=[u for u in last_used if u in stores],
+    key="stores_sel",
     format_func=store_label,
     placeholder="اختر من المتاجر السابقة..." if stores else "لا توجد عمليات بحث سابقة بعد",
 )
