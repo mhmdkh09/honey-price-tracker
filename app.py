@@ -570,9 +570,9 @@ def search_duckduckgo(query, num=20):
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def web_search(query, num=20):
+def _web_search(query, num, use_google):
     """يرجع (النتائج، المصدر، رسالة خطأ)."""
-    if get_secret("SERPER_API_KEY"):
+    if use_google:
         try:
             return search_google(query, num), "Google", ""
         except Exception as e:
@@ -583,6 +583,11 @@ def web_search(query, num=20):
         return search_duckduckgo(query, num), "DuckDuckGo", error
     except Exception as e:
         return [], "", (error + " — " if error else "") + f"تعذّر البحث: {e}"
+
+
+def web_search(query, num=20):
+    # وجود المفتاح جزء من مفتاح الذاكرة المؤقتة، حتى تظهر نتائج جوجل فور إضافته
+    return _web_search(query, num, bool(get_secret("SERPER_API_KEY")))
 
 
 def group_by_store(results):
@@ -658,6 +663,8 @@ with st.expander("🔎 ابحث في جوجل عن متاجر عسل جديدة"
             st.warning(err)
         if source == "DuckDuckGo":
             st.caption("النتائج من DuckDuckGo لأن مفتاح جوجل (SERPER_API_KEY) غير مضاف بعد.")
+        elif source == "Google":
+            st.caption("✅ النتائج من جوجل")
         if not found:
             st.info("لم أجد متاجر في النتائج. جرّب كلمات أخرى.")
         else:
